@@ -1,4 +1,4 @@
-# GridSFM AC-OPF verifier (loads, line ratings, generators, costs, voltage limits).
+# AC-OPF verifier (loads, line ratings, generators, costs, voltage limits).
 #
 # Julia API:
 #   initialize_case("/path/to/texas_model.json")
@@ -10,9 +10,9 @@
 # Unspecified fields keep their original values. Use PowerModels case units.
 #
 # Module name retained because existing Python notebooks import
-# `jl.GridSFMLoadVerifier`; the API itself is mode-independent.
+# `jl.ACOPFVerifier`; the API itself is mode-independent.
 
-module GridSFMLoadVerifier
+module ACOPFVerifier
 
 using PowerModels, Ipopt, JSON3
 using JuMP: optimizer_with_attributes
@@ -285,4 +285,4 @@ function verify_scenario_json(scenario_json::AbstractString)
     end
 end
 
-end # module GridSFMLoadVerifier
+end # module ACOPFVerifier
