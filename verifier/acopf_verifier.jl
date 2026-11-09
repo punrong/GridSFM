@@ -1,32 +1,25 @@
-# GridSFM AC-OPF verifier for mixed perturbation scenarios.
-# Keeps the original module name and load-only API for compatibility with Python/juliacall.
-# The same PowerModels ACP + Ipopt formulation is used for every scenario.
+# GridSFM AC-OPF verifier (loads, line ratings, generators, costs, voltage limits).
 #
-# Call once: initialize_case(".../texas_model.json", JSON3.write(load_ids))
-#   - The load IDs argument is optional for the generalized API.
-# Call for any combination of perturbations: verify_scenario_json(JSON3.write(patch))
+# Julia API:
+#   initialize_case("/path/to/texas_model.json")
+#   verify_scenario_json(JSON3.write(patch))
 #
-# Sparse patch example, using IDs from the PowerModels JSON and its native units:
-# {
-#   "load":   {"12": {"pd": 0.50, "qd": 0.20}},
-#   "branch": {"5": {"rate_a": 1.25, "rate_b": 1.40, "rate_c": 1.60}},
-#   "gen":    {"2": {"gen_status": 0}, "3": {"cost": [0.2, 1.0, 0.0]}},
-#   "bus":    {"7": {"vmin": 0.96, "vmax": 1.04}}
-# }
-# NOTE: These are illustrative numbers, NOT GridSFM settings or valid IDs.
-#       Data fields are read in the same units as PowerModels.parse_file returns.
-#       The standard build_opf formulation primarily uses branch rate_a as a
-#       thermal rating; modifying rate_b/rate_c may not affect OPF feasibility.
+# The patch is a dictionary keyed by component IDs, e.g.:
+#   Dict("load" => Dict("12" => Dict("pd" => 0.50, "qd" => 0.20)))
+# Different sections ("load", "branch", "gen", "bus") may be combined.
+# Unspecified fields keep their original values. Use PowerModels case units.
+#
+# Module name retained because existing Python notebooks import
+# `jl.GridSFMLoadVerifier`; the API itself is mode-independent.
 
 module GridSFMLoadVerifier
 
-using PowerModels, Ipopt, JuMP, JSON3
+using PowerModels, Ipopt, JSON3
 using JuMP: optimizer_with_attributes
 
-export initialize_case, verify_scenario_json, verify_loads_json
+export initialize_case, verify_scenario_json
 
 const BASE_CASE = Ref{Any}(nothing)
-const ACTIVE_IDS = Ref{Vector{String}}(String[])
 const SOLVER = Ref{Any}(nothing)
 
 const ALLOWED_FIELDS = Dict(
@@ -79,29 +72,19 @@ function response_error(status::String, reason::String; stage::String="validatio
 end
 
 """
-    initialize_case(case_path, ids_json="[]")
+    initialize_case(case_path)
 
-Parse the PowerModels case once and construct the Ipopt optimizer.
-`ids_json` is a JSON array of active LOAD IDs for the legacy load-only method.
-For `verify_scenario_json`, IDs are included in each patch, so `ids_json` is optional.
+Parse one PowerModels JSON network and prepare the Ipopt solver. Run once
+before calling `verify_scenario_json` for any perturbation mode.
 """
-function initialize_case(case_path::AbstractString, ids_json::AbstractString="[]")
-    # Do not leave an old case active if re-initialization fails.
+function initialize_case(case_path::AbstractString)
     BASE_CASE[] = nothing
-    ACTIVE_IDS[] = String[]
     SOLVER[] = nothing
 
     isfile(case_path) || error("Case JSON not found: $case_path")
     data = PowerModels.parse_file(String(case_path); import_all=false, validate=true)
-    get(data, "multinetwork", false) == false || error("This verifier expects one network, not a multinetwork case")
-    ids_raw = JSON3.read(String(ids_json))
-    ids_raw isa AbstractVector || error("ids_json must be a JSON array of load IDs")
-    ids = [string(id) for id in ids_raw]
-    length(ids) == length(unique(ids)) || error("Repeated load IDs")
-    for id in ids
-        haskey(data["load"], id) || error("Load ID not in Julia case: $id")
-        Int(get(data["load"][id], "status", 1)) == 1 || error("Inactive load ID: $id")
-    end
+    get(data, "multinetwork", false) == false ||
+        error("This verifier expects one network, not a multinetwork case")
 
     optimizer = optimizer_with_attributes(Ipopt.Optimizer,
         "print_level" => 0, "sb" => "yes",
@@ -109,12 +92,10 @@ function initialize_case(case_path::AbstractString, ids_json::AbstractString="[]
     PowerModels.silence()
 
     BASE_CASE[] = data
-    ACTIVE_IDS[] = ids
     SOLVER[] = optimizer
     return JSON3.write(Dict(
         "initialized" => true,
-        "n_loads" => length(ids),  # load IDs registered for legacy method
-        "n_total_loads" => length(data["load"]),
+        "n_loads" => length(data["load"]),
         "n_buses" => length(data["bus"]),
         "n_generators" => length(data["gen"]),
         "n_branches" => length(data["branch"]),
@@ -267,12 +248,12 @@ function verify_scenario_json(scenario_json::AbstractString)
     end
 
     try
-        # Same AC polar formulation, OPF objective and Ipopt settings as before.
+        # Run AC polar OPF with the configured Ipopt solver.
         pm = PowerModels.instantiate_model(data, ACPPowerModel, PowerModels.build_opf)
         result = PowerModels.optimize_model!(pm, optimizer=SOLVER[])
         termination = string(get(result, "termination_status", "UNKNOWN"))
         primal = string(get(result, "primal_status", "UNKNOWN"))
-        # Strict acceptance is unchanged: successfully solved + feasible point.
+        # Accept only a successful solve with a feasible primal point.
         accepted = (termination in ("LOCALLY_SOLVED", "OPTIMAL")) && primal == "FEASIBLE_POINT"
         return JSON3.write(Dict(
             "accepted" => accepted,
@@ -301,32 +282,6 @@ function verify_scenario_json(scenario_json::AbstractString)
             "modes" => sort!(collect(keys(counts))),
             "warnings" => warnings,
         ))
-    end
-end
-
-"""
-    verify_loads_json(load_values_json)
-
-Backward-compatible interface: JSON list of [pd, qd] in exactly the order
-of the active load IDs passed to `initialize_case`.
-"""
-function verify_loads_json(load_values_json::AbstractString)
-    BASE_CASE[] === nothing && return response_error("NOT_INITIALIZED", "Call initialize_case first")
-    try
-        values = JSON3.read(String(load_values_json))
-        values isa AbstractVector || invalid("Load-only input must be a JSON list of [pd, qd] pairs")
-        ids = ACTIVE_IDS[]
-        isempty(ids) && invalid("Initialize with load IDs before calling verify_loads_json")
-        length(values) == length(ids) ||
-            invalid("Expected $(length(ids)) Pd/Qd pairs, got $(length(values))")
-        updates = Dict{String, Any}()
-        for (id, pair) in zip(ids, values)
-            pair isa AbstractVector && length(pair) == 2 || invalid("Load $id must contain [Pd, Qd]")
-            updates[id] = Dict("pd" => pair[1], "qd" => pair[2])
-        end
-        return verify_scenario_json(JSON3.write(Dict("load" => updates)))
-    catch err
-        return response_error("INVALID_SCENARIO", sprint(showerror, err))
     end
 end
 
